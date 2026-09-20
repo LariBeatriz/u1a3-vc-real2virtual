@@ -129,6 +129,9 @@
       <!-- Contentor de objetos da cena -->
       <a-entity id="sceneObjects"></a-entity>
 
+      <!-- Pessoas detectadas pela visão computacional -->
+      <a-entity id="peopleObjects"></a-entity>
+
       <!-- Céu -->
       <a-sky id="sky" color="#87CEEB"></a-sky>
 
@@ -136,6 +139,7 @@
 
     <!-- Overlay informativo -->
     <div class="scene-overlay">
+      <span class="badge" id="peopleCountBadge">0 pessoas</span>
       <span class="badge" id="objCountBadge">0 objetos</span>
       <span class="badge">WASD + Mouse para navegar</span>
       <span class="badge">VR disponível (clique 🥽)</span>

@@ -19,12 +19,361 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 let socket = null;
 let camStream = null;
 let captureTimer = null;
-let currentPipeline = "edges";
+let currentPipeline = "faces";
 let frameCount = 0;
 let lastFpsTime = Date.now();
 let waitingResult = false;
 let broadcasting = false;
 let gridVisible = true;
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Tracking de rostos
+   ═══════════════════════════════════════════════════════════════════════ */
+
+let nextPersonId = 1;
+
+// Guarda os rostos conhecidos entre um frame e outro
+const faceTracks = new Map();
+
+// Guarda as pessoas rastreadas no último frame
+let lastTrackedPeople = [];
+
+// Distância máxima normalizada para considerar que é a mesma pessoa
+const TRACK_MAX_DISTANCE = 0.35;
+
+// Depois desse tempo sem aparecer, esquecemos a pessoa
+const TRACK_TTL_MS = 2000;
+
+function getNextAvailablePersonId() {
+  let id = 1;
+
+  while (faceTracks.has(id)) {
+    id++;
+  }
+
+  return id;
+}
+
+
+function trackFaces(faces, imgW, imgH) {
+  const now = Date.now();
+
+  /*
+   * Remove pessoas que desapareceram
+   * por mais de 2 segundos.
+   */
+  for (const [id, track] of faceTracks.entries()) {
+    if (now - track.lastSeen > TRACK_TTL_MS) {
+      faceTracks.delete(id);
+
+      console.log(
+        `Pessoa ${id} removida do tracking`
+      );
+    }
+  }
+
+  /*
+   * Caso especial:
+   *
+   * Se existe apenas UM rosto na câmera,
+   * tentamos sempre manter o ID já existente.
+   *
+   * Isso evita:
+   *
+   * Pessoa 1
+   * ↓ perde 1 frame
+   * Pessoa 2
+   */
+  if (faces.length === 1) {
+    const face = faces[0];
+
+    const cx = face.x + face.w / 2;
+    const cy = face.y + face.h / 2;
+
+    const nx = cx / imgW;
+    const ny = cy / imgH;
+
+    const faceRatio = Math.max(
+      face.w / imgW,
+      0.01
+    );
+
+    let personId = null;
+    let oldTrack = null;
+
+    /*
+     * Procura o track existente
+     * mais recente.
+     */
+    if (faceTracks.size > 0) {
+      let bestDistance = Infinity;
+
+      for (const [id, track] of faceTracks.entries()) {
+        const distance = Math.hypot(
+          nx - track.nx,
+          ny - track.ny
+        );
+
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          personId = id;
+          oldTrack = track;
+        }
+      }
+    }
+
+    /*
+     * Nenhum track ainda:
+     * cria Pessoa 1.
+     */
+    if (personId === null) {
+      personId = getNextAvailablePersonId();
+
+      console.log(
+        `Nova pessoa detectada: Pessoa ${personId}`
+      );
+    }
+
+    /*
+     * Suavização do movimento.
+     */
+    let smoothNx = nx;
+    let smoothNy = ny;
+    let smoothFaceRatio = faceRatio;
+
+    if (oldTrack) {
+      const smoothing = 0.35;
+
+      smoothNx =
+        oldTrack.nx * (1 - smoothing) +
+        nx * smoothing;
+
+      smoothNy =
+        oldTrack.ny * (1 - smoothing) +
+        ny * smoothing;
+
+      smoothFaceRatio =
+        oldTrack.faceRatio * (1 - smoothing) +
+        faceRatio * smoothing;
+    }
+
+    const track = {
+      id: personId,
+
+      name: `Pessoa ${personId}`,
+
+      nx: smoothNx,
+      ny: smoothNy,
+
+      faceRatio: smoothFaceRatio,
+
+      lastSeen: now
+    };
+
+    faceTracks.set(
+      personId,
+      track
+    );
+
+    return [
+      {
+        ...face,
+
+        id: personId,
+
+        name: `Pessoa ${personId}`,
+
+        nx: smoothNx,
+        ny: smoothNy,
+
+        faceRatio: smoothFaceRatio
+      }
+    ];
+  }
+
+
+  /*
+   * ==========================================================
+   * MÚLTIPLAS PESSOAS
+   * ==========================================================
+   */
+
+  const usedIds = new Set();
+
+  const trackedFaces = [];
+
+  for (const face of faces) {
+    const cx = face.x + face.w / 2;
+    const cy = face.y + face.h / 2;
+
+    const nx = cx / imgW;
+    const ny = cy / imgH;
+
+    const faceRatio = Math.max(
+      face.w / imgW,
+      0.01
+    );
+
+    let bestId = null;
+    let bestTrack = null;
+    let bestDistance = Infinity;
+
+    /*
+     * Procura a pessoa anterior
+     * mais próxima.
+     */
+    for (const [id, track] of faceTracks.entries()) {
+
+      if (usedIds.has(id)) {
+        continue;
+      }
+
+      const distance = Math.hypot(
+        nx - track.nx,
+        ny - track.ny
+      );
+
+      if (
+        distance < TRACK_MAX_DISTANCE &&
+        distance < bestDistance
+      ) {
+        bestDistance = distance;
+
+        bestId = id;
+
+        bestTrack = track;
+      }
+    }
+
+
+    /*
+     * Não encontrou correspondência:
+     * cria uma nova pessoa.
+     */
+    if (bestId === null) {
+      bestId = getNextAvailablePersonId();
+
+      console.log(
+        `Nova pessoa detectada: Pessoa ${bestId}`
+      );
+    }
+
+    usedIds.add(bestId);
+
+
+    /*
+     * Suavização
+     */
+    let smoothNx = nx;
+    let smoothNy = ny;
+    let smoothFaceRatio = faceRatio;
+
+    if (bestTrack) {
+      const smoothing = 0.35;
+
+      smoothNx =
+        bestTrack.nx * (1 - smoothing) +
+        nx * smoothing;
+
+      smoothNy =
+        bestTrack.ny * (1 - smoothing) +
+        ny * smoothing;
+
+      smoothFaceRatio =
+        bestTrack.faceRatio * (1 - smoothing) +
+        faceRatio * smoothing;
+    }
+
+
+    const track = {
+      id: bestId,
+
+      name: `Pessoa ${bestId}`,
+
+      nx: smoothNx,
+      ny: smoothNy,
+
+      faceRatio: smoothFaceRatio,
+
+      lastSeen: now
+    };
+
+
+    faceTracks.set(
+      bestId,
+      track
+    );
+
+
+    trackedFaces.push({
+      ...face,
+
+      id: bestId,
+
+      name: `Pessoa ${bestId}`,
+
+      nx: smoothNx,
+      ny: smoothNy,
+
+      faceRatio: smoothFaceRatio
+    });
+  }
+
+  return trackedFaces;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Labels das pessoas
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function createPersonLabel(text) {
+  const canvas = document.createElement("canvas");
+
+  canvas.width = 512;
+  canvas.height = 128;
+
+  const ctx = canvas.getContext("2d");
+
+  // Fundo
+  ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+  ctx.fillRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  // Texto
+  ctx.font = "bold 52px Arial";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffffff";
+
+  ctx.fillText(
+    text,
+    canvas.width / 2,
+    canvas.height / 2
+  );
+
+  const texture = new THREE.CanvasTexture(canvas);
+
+  texture.needsUpdate = true;
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true
+  });
+
+  const sprite = new THREE.Sprite(material);
+
+  sprite.scale.set(
+    2.6,
+    0.65,
+    1
+  );
+
+  return sprite;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
    DOM
@@ -183,8 +532,22 @@ function clearCVGroup() {
     if (child.geometry) child.geometry.dispose();
     if (child.material) {
       if (Array.isArray(child.material)) {
-        child.material.forEach((m) => m.dispose());
+
+        child.material.forEach((m) => {
+
+          if (m.map) {
+            m.map.dispose();
+          }
+
+          m.dispose();
+        });
+
       } else {
+
+        if (child.material.map) {
+          child.material.map.dispose();
+        }
+
         child.material.dispose();
       }
     }
@@ -272,41 +635,279 @@ function mapContours(shapes, imgW, imgH) {
 }
 
 function mapFaces(faces, imgW, imgH) {
-  for (const face of faces) {
-    const cx = face.x + face.w / 2;
-    const cy = face.y + face.h / 2;
-    const pos = pixelToWorld(cx, cy, imgW, imgH);
 
-    // Raio baseado no tamanho da face
-    const radius = Math.max((face.w / imgW) * 3, 0.2);
-    const geo = new THREE.SphereGeometry(radius, 24, 24);
-    const mat = new THREE.MeshStandardMaterial({
-      color: PIPELINE_COLORS.faces,
-      metalness: 0.4,
-      roughness: 0.5,
-      emissive: 0xff6584,
-      emissiveIntensity: 0.15,
+  /*
+   * Primeiro associamos cada rosto
+   * a uma Pessoa N.
+   */
+  const people = trackFaces(
+    faces,
+    imgW,
+    imgH
+  );
+
+  const peopleForVR = [];
+
+  for (const person of people) {
+
+    /*
+     * --------------------------------
+     * X e Y
+     * --------------------------------
+     */
+
+    // Usa as posições suavizadas do tracking
+    const px =
+      person.nx * imgW;
+
+    const py =
+      person.ny * imgH;
+
+    const pos = pixelToWorld(
+      px,
+      py,
+      imgW,
+      imgH
+    );
+
+
+    /*
+     * --------------------------------
+     * Z / profundidade
+     * --------------------------------
+     */
+
+    const faceRatio =
+      person.faceRatio;
+
+    /*
+     * Rosto grande:
+     * distance pequena.
+     *
+     * Rosto pequeno:
+     * distance grande.
+     */
+    const distance = Math.max(
+      1.5,
+      Math.min(
+        8,
+        0.6 / faceRatio
+      )
+    );
+
+    pos.z = -distance;
+
+    peopleForVR.push({
+      id: person.id,
+
+      name: person.name,
+
+      x: Number(
+        pos.x.toFixed(2)
+      ),
+
+      y: Number(
+        pos.y.toFixed(2)
+      ),
+
+      z: Number(
+        pos.z.toFixed(2)
+      )
     });
-    const mesh = new THREE.Mesh(geo, mat);
+
+
+    /*
+     * --------------------------------
+     * Tamanho da esfera
+     * --------------------------------
+     *
+     * Também fazemos a bola crescer
+     * conforme o rosto fica maior.
+     */
+
+    const radius = Math.max(
+      0.6,
+      Math.min(
+        1.8,
+        faceRatio * 6
+      )
+    );
+
+
+    /*
+     * --------------------------------
+     * Esfera
+     * --------------------------------
+     */
+
+    const geo =
+      new THREE.SphereGeometry(
+        radius,
+        24,
+        24
+      );
+
+    const mat =
+      new THREE.MeshStandardMaterial({
+        color: PIPELINE_COLORS.faces,
+
+        metalness: 0.4,
+
+        roughness: 0.5,
+
+        emissive: 0xff6584,
+
+        emissiveIntensity: 0.15
+      });
+
+    const mesh =
+      new THREE.Mesh(
+        geo,
+        mat
+      );
+
     mesh.position.copy(pos);
+
     mesh.castShadow = true;
+
+    /*
+     * Guardamos o ID também
+     * dentro do objeto Three.js.
+     */
+    mesh.userData.personId =
+      person.id;
+
+    mesh.userData.personName =
+      person.name;
+
     cvGroup.add(mesh);
 
-    // Anel ao redor da esfera para indicar detecção
-    const ringGeo = new THREE.TorusGeometry(radius * 1.4, 0.04, 8, 32);
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.5,
-    });
-    const ring = new THREE.Mesh(ringGeo, ringMat);
+
+    /*
+     * --------------------------------
+     * Anel da detecção
+     * --------------------------------
+     */
+
+    const ringGeo =
+      new THREE.TorusGeometry(
+        radius * 1.4,
+        0.04,
+        8,
+        32
+      );
+
+    const ringMat =
+      new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+
+        transparent: true,
+
+        opacity: 0.5
+      });
+
+    const ring =
+      new THREE.Mesh(
+        ringGeo,
+        ringMat
+      );
+
     ring.position.copy(pos);
-    ring.rotation.x = Math.PI / 2;
+
+    ring.rotation.x =
+      Math.PI / 2;
+
     cvGroup.add(ring);
+
+
+    /*
+     * --------------------------------
+     * Nome acima da pessoa
+     * --------------------------------
+     */
+
+    const label =
+      createPersonLabel(
+        person.name
+      );
+
+    label.position.set(
+      pos.x,
+
+      pos.y + radius + 0.7,
+
+      pos.z
+    );
+
+    cvGroup.add(label);
+
+
+    /*
+     * --------------------------------
+     * DEBUG
+     * --------------------------------
+     */
+
+    console.log({
+      id: person.id,
+
+      nome: person.name,
+
+      proporcaoRosto:
+        Number(
+          faceRatio.toFixed(3)
+        ),
+
+      distanciaEstimada:
+        Number(
+          distance.toFixed(2)
+        ),
+
+      raioEsfera:
+        Number(
+          radius.toFixed(2)
+        ),
+
+      posicao3D: {
+        x: Number(
+          pos.x.toFixed(2)
+        ),
+
+        y: Number(
+          pos.y.toFixed(2)
+        ),
+
+        z: Number(
+          pos.z.toFixed(2)
+        )
+      }
+    });
   }
 
-  updateMappingInfo("faces", faces.length, `${faces.length} rosto(s) → esferas 3D`);
-  return faces.length;
+
+  /*
+   * Informação exibida no painel.
+   */
+
+  const names =
+    people
+      .map(person => person.name)
+      .join(", ");
+
+  updateMappingInfo(
+    "faces",
+
+    people.length,
+
+    people.length > 0
+      ? `${people.length} pessoa(s): ${names}`
+      : "Nenhuma pessoa detectada"
+  );
+
+  lastTrackedPeople = peopleForVR;
+
+
+  return people.length;
 }
 
 function mapEdgesWireframe(points, imgW, imgH) {
@@ -480,6 +1081,8 @@ function stopCamera() {
   fpsBadge.style.display = "none";
   btnStartCam.disabled = false;
   btnStopCam.disabled = true;
+  faceTracks.clear();
+  nextPersonId = 1;
   log("Câmera parada.");
 }
 
@@ -623,6 +1226,15 @@ function initSocket() {
     // Mapear geometria para 3D
     if (data.geometry) {
       const count = mapGeometry(data.geometry);
+      if (
+        data.pipeline === "faces" &&
+        data.geometry.type === "faces"
+      ) {
+        socket.emit("cv_people_update", {
+          people: lastTrackedPeople
+        });
+      }
+
       // Se broadcasting, enviar dados geométricos para outros clientes
       if (broadcasting) {
         socket.emit("cv3d_broadcast", {
