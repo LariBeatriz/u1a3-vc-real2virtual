@@ -9,9 +9,42 @@
 
 "use strict";
 
+const PERSON_COLORS = [
+  "#FF6584",
+  "#4CC3D9",
+  "#43E97B",
+  "#FFD166",
+  "#A78BFA",
+  "#FF8A65",
+  "#64B5F6",
+  "#F06292"
+];
+
+
+function getPersonColor(id) {
+  return PERSON_COLORS[
+    (Number(id) - 1) % PERSON_COLORS.length
+  ];
+}
+
 /* ── Estado local ── */
 const localState = { objects: {}, skyColor: "#87CEEB" };
 let socket = null;
+
+/*
+ * Pessoas detectadas pelo CV.
+ *
+ * ID -> informações da pessoa.
+ */
+const peopleState = new Map();
+
+/*
+ * Tempo que aguardamos antes de remover um avatar.
+ *
+ * Isso evita que a esfera fique piscando caso
+ * o Haar Cascade perca o rosto durante 1 frame.
+ */
+const PERSON_REMOVE_DELAY = 1500;
 
 /* ── Elementos DOM ── */
 const statusDot   = document.getElementById("statusDot");
@@ -19,6 +52,7 @@ const statusText  = document.getElementById("statusText");
 const connInfo    = document.getElementById("connInfo");
 const objCountEl  = document.getElementById("objCount");
 const objCountBadge = document.getElementById("objCountBadge");
+const peopleCountBadge = document.getElementById("peopleCountBadge");
 const objectList  = document.getElementById("objectList");
 const logPanel    = document.getElementById("logPanel");
 
@@ -45,6 +79,19 @@ function updateCounts() {
   const n = Object.keys(localState.objects).length;
   objCountEl.textContent = n;
   objCountBadge.textContent = `${n} objeto${n !== 1 ? "s" : ""}`;
+}
+
+function updatePeopleCount() {
+  const count =
+    peopleState.size;
+
+  if (!peopleCountBadge) {
+    return;
+  }
+
+  peopleCountBadge.textContent =
+    `${count} pessoa` +
+    `${count !== 1 ? "s" : ""}`;
 }
 
 /* ── Cena A-Frame helpers ── */
@@ -83,6 +130,356 @@ function removeAnimation(el) {
   el.setAttribute("rotation", "0 0 0");
 }
 
+function createPersonAvatar(person) {
+  /*
+   * Entidade principal da pessoa.
+   * É ela que recebe a posição X/Y/Z.
+   */
+  const root =
+    document.createElement("a-entity");
+
+  root.setAttribute(
+    "id",
+    `person-${person.id}`
+  );
+
+  root.setAttribute(
+    "position",
+    `${person.x} ${person.y} ${person.z}`
+  );
+
+
+  /*
+   * Cor baseada no ID.
+   */
+  const color =
+    getPersonColor(person.id);
+
+
+  /* ======================================================
+     ESFERA
+     ====================================================== */
+
+  const sphere =
+    document.createElement("a-sphere");
+
+  sphere.setAttribute(
+    "radius",
+    "0.65"
+  );
+
+  sphere.setAttribute(
+    "color",
+    color
+  );
+
+  sphere.setAttribute(
+    "metalness",
+    "0.15"
+  );
+
+  sphere.setAttribute(
+    "roughness",
+    "0.65"
+  );
+
+  sphere.setAttribute(
+    "shadow",
+    "cast: true; receive: true"
+  );
+
+
+  /* ======================================================
+     FUNDO DO NOME
+     ====================================================== */
+
+  const labelBackground =
+    document.createElement("a-plane");
+
+  labelBackground.setAttribute(
+    "width",
+    "2.3"
+  );
+
+  labelBackground.setAttribute(
+    "height",
+    "0.55"
+  );
+
+  labelBackground.setAttribute(
+    "position",
+    "0 1.5 -0.02"
+  );
+
+  labelBackground.setAttribute(
+    "color",
+    "#000000"
+  );
+
+  labelBackground.setAttribute(
+    "opacity",
+    "0.65"
+  );
+
+  labelBackground.setAttribute(
+    "material",
+    "transparent: true; side: double"
+  );
+
+
+  /* ======================================================
+     NOME FLUTUANDO
+     ====================================================== */
+
+  const label =
+    document.createElement("a-text");
+
+  label.setAttribute(
+    "id",
+    `person-label-${person.id}`
+  );
+
+  label.setAttribute(
+    "value",
+    person.name || `Pessoa ${person.id}`
+  );
+
+  label.setAttribute(
+    "align",
+    "center"
+  );
+
+  label.setAttribute(
+    "anchor",
+    "center"
+  );
+
+  label.setAttribute(
+    "baseline",
+    "center"
+  );
+
+  label.setAttribute(
+    "color",
+    "#FFFFFF"
+  );
+
+  /*
+   * Quanto maior o width,
+   * maior fica o texto.
+   */
+  label.setAttribute(
+    "width",
+    "5"
+  );
+
+  /*
+   * Nome flutuando 1.5 unidades
+   * acima do centro da pessoa.
+   */
+  label.setAttribute(
+    "position",
+    "0 1.5 0"
+  );
+
+
+  /* ======================================================
+     MARCADOR ABAIXO DA ESFERA
+     ====================================================== */
+
+  const marker =
+    document.createElement("a-cylinder");
+
+  marker.setAttribute(
+    "radius",
+    "0.08"
+  );
+
+  marker.setAttribute(
+    "height",
+    "0.5"
+  );
+
+  marker.setAttribute(
+    "position",
+    "0 -0.9 0"
+  );
+
+  marker.setAttribute(
+    "color",
+    color
+  );
+
+
+  /* ======================================================
+     MONTA O AVATAR
+     ====================================================== */
+
+  root.appendChild(sphere);
+
+  /*
+   * Primeiro o fundo,
+   * depois o texto.
+   */
+  root.appendChild(labelBackground);
+  root.appendChild(label);
+
+  root.appendChild(marker);
+
+
+  return root;
+}
+
+function updatePeople(people) {
+  const container =
+    document.getElementById(
+      "peopleObjects"
+    );
+
+  const now = Date.now();
+
+  const receivedIds = new Set();
+
+
+  /*
+   * ======================================================
+   * CRIAR OU ATUALIZAR
+   * ======================================================
+   */
+
+  for (const person of people) {
+
+    const id =
+      String(person.id);
+
+    receivedIds.add(id);
+
+
+    let entity =
+      document.getElementById(
+        `person-${id}`
+      );
+
+
+    /*
+     * Pessoa nova:
+     * cria o avatar.
+     */
+    if (!entity) {
+
+      entity =
+        createPersonAvatar(person);
+
+      container.appendChild(entity);
+
+      log(
+        `${person.name} entrou na cena.`,
+        "info"
+      );
+    }
+
+
+    /*
+     * Pessoa já existe:
+     * NÃO recriamos.
+     *
+     * Apenas atualizamos a posição.
+     */
+    entity.setAttribute(
+      "position",
+
+      `${person.x} ` +
+      `${person.y} ` +
+      `${person.z}`
+    );
+
+
+    /*
+     * Atualiza nome caso mude.
+     */
+    const label =
+      document.getElementById(
+        `person-label-${id}`
+      );
+
+    if (label) {
+      label.setAttribute(
+        "value",
+        person.name
+      );
+    }
+
+
+    /*
+     * Guarda estado local.
+     */
+    peopleState.set(
+      id,
+      {
+        ...person,
+
+        lastSeen: now
+      }
+    );
+  }
+
+
+  /*
+   * ======================================================
+   * REMOVER QUEM SUMIU
+   * ======================================================
+   *
+   * Não removemos imediatamente.
+   *
+   * O Haar Cascade pode perder um rosto
+   * durante um único frame.
+   */
+
+  for (
+    const [id, state]
+    of peopleState.entries()
+  ) {
+
+    /*
+     * Se recebeu essa pessoa neste frame,
+     * não há nada para fazer.
+     */
+    if (receivedIds.has(id)) {
+      continue;
+    }
+
+
+    const missingFor =
+      now - state.lastSeen;
+
+
+    if (
+      missingFor >
+      PERSON_REMOVE_DELAY
+    ) {
+
+      const entity =
+        document.getElementById(
+          `person-${id}`
+        );
+
+      if (entity) {
+        entity.remove();
+      }
+
+      peopleState.delete(id);
+
+      log(
+        `${state.name} saiu da cena.`,
+        "warning"
+      );
+    }
+  }
+
+
+  updatePeopleCount();
+}
+
 /* ── Socket.IO ── */
 function initSocket() {
   socket = io({ transports: ["websocket"] });
@@ -113,6 +510,34 @@ function initSocket() {
     state.objects.forEach(addObjectToScene);
     updateCounts();
   });
+
+  socket.on(
+    "vr_people_update",
+    ({ people }) => {
+
+      const safePeople =
+        Array.isArray(people)
+          ? people
+          : [];
+
+      /*
+      * Mantemos o console para debug.
+      */
+      console.log(
+        "Pessoas recebidas do CV:",
+        safePeople
+      );
+
+
+      /*
+      * Agora realmente atualizamos
+      * a cena A-Frame.
+      */
+      updatePeople(
+        safePeople
+      );
+    }
+  );
 
   socket.on("object_added", (obj) => {
     addObjectToScene(obj);

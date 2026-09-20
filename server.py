@@ -1104,6 +1104,84 @@ def on_cv3d_frame(data):
         emit("cv3d_result", {"error": str(exc)})
 
 
+@socketio.on("cv_people_update")
+def on_cv_people_update(data):
+    """
+    Recebe as pessoas detectadas pelo CV3D
+    e retransmite suas posições para clientes AR/VR.
+    """
+
+    if not isinstance(data, dict):
+        return
+
+    raw_people = data.get("people", [])
+
+    if not isinstance(raw_people, list):
+        return
+
+    # Limita a quantidade recebida por frame.
+    raw_people = raw_people[:20]
+
+    people = []
+
+    for raw_person in raw_people:
+        if not isinstance(raw_person, dict):
+            continue
+
+        try:
+            person_id = int(
+                raw_person.get("id")
+            )
+
+            name = str(
+                raw_person.get(
+                    "name",
+                    f"Pessoa {person_id}"
+                )
+            )[:40]
+
+            x = float(
+                raw_person.get("x", 0)
+            )
+
+            y = float(
+                raw_person.get("y", 1)
+            )
+
+            z = float(
+                raw_person.get("z", -3)
+            )
+
+        except (TypeError, ValueError):
+            continue
+
+        # Limites básicos da nossa cena virtual.
+        x = max(-10.0, min(10.0, x))
+        y = max(-5.0, min(10.0, y))
+        z = max(-15.0, min(-0.5, z))
+
+        people.append({
+            "id": person_id,
+            "name": name,
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "z": round(z, 2),
+        })
+
+    logger.info(
+        "CV → VR: %d pessoa(s)",
+        len(people)
+    )
+
+    socketio.emit(
+        "vr_people_update",
+        {
+            "people": people
+        },
+        to="arvr"
+    )
+
+
 @socketio.on("cv3d_broadcast")
 def on_cv3d_broadcast(data):
     """Retransmite dados da cena 3D para outros clientes na sala cv3d."""
